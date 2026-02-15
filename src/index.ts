@@ -3,6 +3,13 @@ import { getEventStream } from "./docker-events"
 import { logger } from "./logger"
 
 const NETWORK_NAME = "apps-internal"
+const DEFAULT_HOST_GATEWAY_ALIASES = [ "host-gateway.svc.cluster.local" ]
+
+type HostGatewayConfig = {
+  enabled: boolean
+  aliases: string[]
+  gatewayIp?: string
+}
 
 async function setUpNetwork(docker: Docker) {
   logger.info(`Setting up network ${NETWORK_NAME}`)
@@ -32,6 +39,110 @@ function prohibitedNetworkMode(networkMode: string) {
   return [ "none", "host" ].includes(networkMode) ||
     networkMode.startsWith("container:") ||
     networkMode.startsWith("service:")
+}
+
+function parseHostGatewayAliases(value?: string) {
+  if (!value) {
+    return DEFAULT_HOST_GATEWAY_ALIASES
+  }
+
+  const aliases = value
+    .split(/[,\s]+/)
+    .map((alias) => alias.trim())
+    .filter((alias) => alias.length > 0)
+
+  return aliases.length > 0 ? aliases : DEFAULT_HOST_GATEWAY_ALIASES
+}
+
+function getHostGatewayConfigFromEnv(): HostGatewayConfig {
+  const enabled = (process.env.ENABLE_HOST_GATEWAY_ALIAS ?? "true").toLowerCase() !== "false"
+  const aliases = parseHostGatewayAliases(process.env.HOST_GATEWAY_ALIASES)
+
+  return {
+    enabled,
+    aliases
+  }
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+async function getAppsNetworkGatewayIp(docker: Docker) {
+  const network = docker.getNetwork(NETWORK_NAME)
+  const details = await network.inspect()
+  return details.IPAM?.Config?.find((config) => config.Gateway)?.Gateway
+}
+
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function runContainerExec(container: Docker.Container, command: string[]) {
+  const exec = await container.exec({
+    Cmd: command,
+    AttachStderr: false,
+    AttachStdout: false
+  })
+
+  await exec.start({ hijack: false, stdin: false })
+
+  while (true) {
+    const info = await exec.inspect()
+    if (!info.Running) {
+      return info.ExitCode ?? 1
+    }
+
+    await sleep(100)
+  }
+}
+
+async function runShellScriptInContainer(container: Docker.Container, script: string) {
+  const shellCandidates = [
+    [ "/bin/sh", "-c", script ],
+    [ "sh", "-c", script ],
+    [ "/bin/ash", "-c", script ],
+    [ "ash", "-c", script ],
+  ]
+
+  for (const command of shellCandidates) {
+    try {
+      const exitCode = await runContainerExec(container, command)
+      if (exitCode === 0) {
+        return true
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return false
+}
+
+async function ensureHostGatewayAliasesForContainer(docker: Docker, container: Docker.ContainerInfo, hostGatewayConfig: HostGatewayConfig) {
+  if (!hostGatewayConfig.enabled || !hostGatewayConfig.gatewayIp) {
+    return
+  }
+
+  const containerRef = docker.getContainer(container.Id)
+  const script = hostGatewayConfig.aliases
+    .map((alias) => {
+      const escapedAlias = escapeRegex(alias)
+      return `grep -Eq '(^|[[:space:]])${escapedAlias}([[:space:]]|$)' /etc/hosts || echo "${hostGatewayConfig.gatewayIp} ${alias}" >> /etc/hosts`
+    })
+    .join("\n")
+
+  const success = await runShellScriptInContainer(containerRef, script)
+  if (!success) {
+    logger.warn(
+      `Failed to add host gateway aliases (${hostGatewayConfig.aliases.join(", ")}) to container ${container.Id}`
+    )
+    return
+  }
+
+  logger.debug(
+    `Ensured host gateway aliases (${hostGatewayConfig.aliases.join(", ")}) for container ${container.Id}`
+  )
 }
 
 async function connectContainerToAppsNetwork(docker: Docker, container: Docker.ContainerInfo) {
@@ -72,7 +183,7 @@ function isIxAppContainer(container: Docker.ContainerInfo) {
   return isIxProjectName(container.Labels["com.docker.compose.project"])
 }
 
-async function connectAllContainersToAppsNetwork(docker: Docker) {
+async function connectAllContainersToAppsNetwork(docker: Docker, hostGatewayConfig: HostGatewayConfig) {
   logger.debug("Connecting existing app containers to network")
 
   const containers = await docker.listContainers({
@@ -86,16 +197,18 @@ async function connectAllContainersToAppsNetwork(docker: Docker) {
   for (const container of appContainers) {
     if (isContainerInNetwork(container)) {
       logger.debug(`Container ${container.Id} already connected to network`)
+      await ensureHostGatewayAliasesForContainer(docker, container, hostGatewayConfig)
       continue
     }
 
     await connectContainerToAppsNetwork(docker, container)
+    await ensureHostGatewayAliasesForContainer(docker, container, hostGatewayConfig)
   }
 
   logger.info("All existing app containers connected to network")
 }
 
-async function connectNewContainerToAppsNetwork(docker: Docker, containerId: string) {
+async function connectNewContainerToAppsNetwork(docker: Docker, containerId: string, hostGatewayConfig: HostGatewayConfig) {
   const [ container ] = await docker.listContainers({
     filters: {
       id: [ containerId ]
@@ -109,18 +222,32 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
 
   if (isContainerInNetwork(container)) {
     logger.debug(`Container ${container.Id} already connected to network`)
+    await ensureHostGatewayAliasesForContainer(docker, container, hostGatewayConfig)
     return
   }
 
   logger.debug(`New container started: ${container.Id}`)
   await connectContainerToAppsNetwork(docker, container)
+  await ensureHostGatewayAliasesForContainer(docker, container, hostGatewayConfig)
 }
 
 async function main() {
   const docker = new Docker()
+  const hostGatewayConfig = getHostGatewayConfigFromEnv()
 
   await setUpNetwork(docker)
-  await connectAllContainersToAppsNetwork(docker)
+  if (hostGatewayConfig.enabled) {
+    hostGatewayConfig.gatewayIp = await getAppsNetworkGatewayIp(docker)
+    if (!hostGatewayConfig.gatewayIp) {
+      logger.warn("Host gateway alias is enabled, but apps-internal gateway IP could not be determined")
+    } else {
+      logger.info(
+        `Host gateway alias enabled: ${hostGatewayConfig.aliases.join(", ")} -> ${hostGatewayConfig.gatewayIp}`
+      )
+    }
+  }
+
+  await connectAllContainersToAppsNetwork(docker, hostGatewayConfig)
 
   const events = getEventStream(docker)
   events.on("container.start", (event) => {
@@ -129,7 +256,7 @@ async function main() {
       return
     }
 
-    connectNewContainerToAppsNetwork(docker, event.Actor["ID"])
+    connectNewContainerToAppsNetwork(docker, event.Actor["ID"], hostGatewayConfig)
   })
 }
 
