@@ -71,7 +71,8 @@ function escapeRegex(value: string) {
 async function getAppsNetworkGatewayIp(docker: Docker) {
   const network = docker.getNetwork(NETWORK_NAME)
   const details = await network.inspect()
-  return details.IPAM?.Config?.find((config) => config.Gateway)?.Gateway
+  const ipamConfigs = details.IPAM?.Config as Array<{ Gateway?: string }> | undefined
+  return ipamConfigs?.find((config: { Gateway?: string }) => config.Gateway)?.Gateway
 }
 
 async function sleep(ms: number) {
