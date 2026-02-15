@@ -82,11 +82,12 @@ async function sleep(ms: number) {
 async function runContainerExec(container: Docker.Container, command: string[]) {
   const exec = await container.exec({
     Cmd: command,
+    User: "0",
     AttachStderr: false,
     AttachStdout: false
   })
 
-  await exec.start({ hijack: false, stdin: false })
+  await exec.start({ Detach: true, Tty: false })
 
   while (true) {
     const info = await exec.inspect()
@@ -112,7 +113,10 @@ async function runShellScriptInContainer(container: Docker.Container, script: st
       if (exitCode === 0) {
         return true
       }
+
+      logger.debug(`Shell command failed with exit code ${exitCode}: ${command.join(" ")}`)
     } catch {
+      logger.debug(`Shell command is unavailable: ${command.join(" ")}`)
       continue
     }
   }
@@ -196,8 +200,9 @@ async function connectAllContainersToAppsNetwork(docker: Docker, hostGatewayConf
 
   const appContainers = containers.filter(isIxAppContainer)
   for (const container of appContainers) {
+    const dnsName = getDnsName(container)
     if (isContainerInNetwork(container)) {
-      logger.debug(`Container ${container.Id} already connected to network`)
+      logger.info(`Container ${container.Id} (aka ${container.Names.join(", ")}) already connected to network as ${dnsName}`)
       await ensureHostGatewayAliasesForContainer(docker, container, hostGatewayConfig)
       continue
     }
@@ -221,8 +226,9 @@ async function connectNewContainerToAppsNetwork(docker: Docker, containerId: str
     return
   }
 
+  const dnsName = getDnsName(container)
   if (isContainerInNetwork(container)) {
-    logger.debug(`Container ${container.Id} already connected to network`)
+    logger.info(`Container ${container.Id} (aka ${container.Names.join(", ")}) already connected to network as ${dnsName}`)
     await ensureHostGatewayAliasesForContainer(docker, container, hostGatewayConfig)
     return
   }
